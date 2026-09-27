@@ -479,4 +479,145 @@ const IDENTITY = { a: 1, b: 0, c: 0, d: 0, e: 1, f: 0 };
   console.log('✓ invertMatrix 逆映射正确，奇异矩阵抛 BAD_MATRIX');
 }
 
+// ---------- 差异区域 buildDifferenceMask / groupDiffRegions / findDifferenceRegions ----------
+
+// 构造 w×h 不透明灰底 RGBA（rgb=base），可再覆盖指定像素
+function solidImage(w, h, rgb) {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    data[i * 4] = rgb[0]; data[i * 4 + 1] = rgb[1]; data[i * 4 + 2] = rgb[2]; data[i * 4 + 3] = 255;
+  }
+  return data;
+}
+const setPx = (data, w, x, y, rgba) => {
+  const o = (y * w + x) * 4;
+  data[o] = rgba[0]; data[o + 1] = rgba[1]; data[o + 2] = rgba[2]; data[o + 3] = rgba[3];
+};
+
+// 36. buildDifferenceMask：相同图像零差异；任一通道超阈值标差异；阈值严格大于
+{
+  const w = 4, h = 2;
+  const a = solidImage(w, h, [200, 100, 50]);
+  const same = solidImage(w, h, [200, 100, 50]);
+  let m = Affine.buildDifferenceMask(a, same, w, h, 32);
+  assert.strictEqual(m.compared, w * h);
+  assert.strictEqual(m.diffCount, 0);
+  assert.strictEqual(m.colorThreshold, 32);
+  // R 通道差值恰好 32：严格大于才标差异 → 无差异
+  const b32 = solidImage(w, h, [200, 100, 50]);
+  b32[0] = 232;
+  m = Affine.buildDifferenceMask(a, b32, w, h, 32);
+  assert.strictEqual(m.diffCount, 0, '差值等于阈值不应标为差异');
+  // R 通道差值 33：标差异
+  const b33 = solidImage(w, h, [200, 100, 50]);
+  b33[0] = 233;
+  m = Affine.buildDifferenceMask(a, b33, w, h, 32);
+  assert.strictEqual(m.diffCount, 1);
+  assert.strictEqual(m.mask[0], 1);
+  // 仅 B 通道超阈值也标差异
+  const bB = solidImage(w, h, [200, 100, 50]);
+  bB[(1 * w + 1) * 4 + 2] = 0; // B 50 → 0，差 50
+  m = Affine.buildDifferenceMask(a, bB, w, h, 32);
+  assert.strictEqual(m.mask[1 * w + 1], 1);
+  console.log('✓ buildDifferenceMask：任一通道严格超阈值即差异，等阈值不算');
+}
+
+// 37. alpha 门槛：双方 alpha 均 ≥ 128 才参与统计
+{
+  const w = 3, h = 1;
+  const ref = solidImage(w, h, [0, 0, 0]);
+  const cmp = solidImage(w, h, [255, 255, 255]); // 每像素 RGB 差 255
+  cmp[3] = 127;        // 像素 0：cmp alpha 127 → 不参与
+  ref[7] = 128;        // 像素 1：ref alpha 128（cmp 255）→ 参与且差异
+  cmp[11] = 128;       // 像素 2：双方 128/128 → 参与且差异
+  const m = Affine.buildDifferenceMask(ref, cmp, w, h, 0);
+  assert.strictEqual(m.compared, 2, '仅双方 alpha 均 ≥ 128 的像素参与');
+  assert.strictEqual(m.diffCount, 2);
+  assert.strictEqual(m.mask[0], 0);
+  assert.strictEqual(m.mask[1], 1);
+  assert.strictEqual(m.mask[2], 1);
+  console.log('✓ buildDifferenceMask：仅统计双方 alpha 均不低于 128 的像素');
+}
+
+// 38. groupDiffRegions：八邻域（对角）连通分组 + 边框与面积
+{
+  const w = 5, h = 5;
+  const mask = new Uint8Array(w * h);
+  // 区域 A：(0,0) 与 (1,1) 仅对角相邻 → 八邻域下同一区域
+  mask[0] = 1; mask[1 * w + 1] = 1;
+  // 区域 B：矩形 (3..4, 3..4)，4 像素
+  mask[3 * w + 3] = 1; mask[3 * w + 4] = 1; mask[4 * w + 3] = 1; mask[4 * w + 4] = 1;
+  const g = Affine.groupDiffRegions(mask, w, h, 1);
+  assert.strictEqual(g.regions.length, 2);
+  assert.strictEqual(g.totalDiffPixels, 6);
+  // 按面积降序：B 在前
+  assert.strictEqual(g.regions[0].pixelCount, 4);
+  assert.deepStrictEqual(g.regions[0].bounds, { x: 3, y: 3, width: 2, height: 2 });
+  assert.strictEqual(g.regions[0].minX, 3); assert.strictEqual(g.regions[0].maxY, 4);
+  assert.strictEqual(g.regions[0].index, 1);
+  const a = g.regions[1];
+  assert.strictEqual(a.pixelCount, 2);
+  assert.deepStrictEqual(a.bounds, { x: 0, y: 0, width: 2, height: 2 });
+  console.log('✓ groupDiffRegions：八邻域对角连通、按面积降序、边框正确');
+}
+
+// 39. 最小面积过滤与掩码就地清空
+{
+  const w = 4, h = 4;
+  const mask = new Uint8Array(w * h);
+  mask[0 * w + 3] = 1;                       // 孤立像素（与下方区域八邻域不相邻）
+  mask[2 * w + 0] = 1; mask[2 * w + 1] = 1; // 2 像素区域
+  let g = Affine.groupDiffRegions(mask.slice(), w, h, 2);
+  assert.strictEqual(g.regions.length, 1, '1 像素区域应被 minArea=2 过滤');
+  assert.strictEqual(g.regions[0].pixelCount, 2);
+  assert.strictEqual(g.filteredCount, 1);
+  g = Affine.groupDiffRegions(mask.slice(), w, h, 0); // 0 表示不过滤
+  assert.strictEqual(g.regions.length, 2);
+  assert.strictEqual(g.minArea, 0);
+  // 掩码被处理过程就地清空
+  const consumed = mask.slice();
+  Affine.groupDiffRegions(consumed, w, h, 1);
+  assert.strictEqual(consumed.every((v) => v === 0), true);
+  console.log('✓ groupDiffRegions：最小面积过滤、0 不过滤、掩码就地清空');
+}
+
+// 40. findDifferenceRegions：端到端，面积相同时保留扫描顺序（结果可复现）
+{
+  const w = 6, h = 3;
+  const ref = solidImage(w, h, [255, 255, 255]);
+  const cmp = solidImage(w, h, [255, 255, 255]);
+  setPx(cmp, w, 0, 0, [0, 0, 0, 255]);   // 左上单像素
+  setPx(cmp, w, 5, 2, [0, 0, 0, 255]);   // 右下单像素
+  const r = Affine.findDifferenceRegions(ref, cmp, w, h, 10, 1);
+  assert.strictEqual(r.diffCount, 2);
+  assert.strictEqual(r.regions.length, 2);
+  assert.strictEqual(r.regions[0].minX, 0, '同面积按扫描顺序，左上在前');
+  assert.strictEqual(r.regions[1].minX, 5);
+  assert.strictEqual(r.width, w); assert.strictEqual(r.height, h);
+  assert.strictEqual(r.colorThreshold, 10); assert.strictEqual(r.minArea, 1);
+  console.log('✓ findDifferenceRegions：端到端分组排序，默认阈值/面积可覆盖');
+}
+
+// 41. 非法参数拒绝
+{
+  const ref = solidImage(2, 2, [0, 0, 0]);
+  const cmp = solidImage(2, 2, [255, 255, 255]);
+  assert.throws(() => Affine.buildDifferenceMask(ref, cmp, 2, 1, 32), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.buildDifferenceMask(ref, cmp, 2, 2, -1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.buildDifferenceMask(ref, cmp, 2, 2, 256), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.buildDifferenceMask(null, cmp, 2, 2, 32), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.groupDiffRegions(new Uint8Array(4), 2, 2, -1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.groupDiffRegions(new Uint8Array(4), 2, 2, 1.5), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.groupDiffRegions(new Uint8Array(3), 2, 2, 1), (e) => e.code === 'BAD_INPUT');
+  console.log('✓ 差异区域：尺寸不符 / 阈值越界 / 非法面积抛 BAD_INPUT');
+}
+
+// 42. 常量默认值
+{
+  assert.strictEqual(Affine.DIFF_ALPHA_MIN, 128);
+  assert.strictEqual(Affine.DEFAULT_DIFF_THRESHOLD, 32);
+  assert.strictEqual(Affine.DEFAULT_DIFF_MIN_AREA, 20);
+  console.log('✓ 差异区域常量：ALPHA_MIN=128 / 默认阈值 32 / 默认最小面积 20');
+}
+
 console.log('\n全部测试通过 ✔');

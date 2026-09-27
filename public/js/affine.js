@@ -30,6 +30,13 @@
  * 越界邻点视为透明黑；颜色先乘 alpha 再插值、输出时还原，alpha 为零时
  * RGB 归零；各通道四舍五入到 0~255。矩阵含非有限值或线性部分行列式绝对值
  * ≤ MIN_MATRIX_DET（1e-12）时拒绝（checkExportMatrix / invertMatrix）。
+ *
+ * 差异区域检测（buildDifferenceMask / groupDiffRegions / findDifferenceRegions，
+ * 可独立调用，纯像素计算、不依赖 DOM）：比较参考图与按拟合矩阵重采样后的
+ * 校准扫描图，仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素，任一 RGB
+ * 通道差值的绝对值超过色差阈值（0~255，严格大于）即标为差异像素；再对差异
+ * 掩码做八邻域连通分组，过滤像素数小于最小面积的区域，剩余区域按面积降序
+ * 输出边框、像素数与坐标范围。
  */
 (function (root, factory) {
   const api = factory();
@@ -49,6 +56,12 @@
   const DEFAULT_TOLERANCE_PX = 2;
   // 像素变换/导出可用性的矩阵阈值：线性部分行列式 |a·e − b·d| 下限
   const MIN_MATRIX_DET = 1e-12;
+  // 差异区域：双方 alpha 均不低于该值的像素才参与逐像素比较
+  const DIFF_ALPHA_MIN = 128;
+  // 差异区域默认色差值（任一 RGB 通道差值绝对值严格大于该值即标为差异）
+  const DEFAULT_DIFF_THRESHOLD = 32;
+  // 差异区域默认最小面积（像素数小于该值的连通区域被过滤）
+  const DEFAULT_DIFF_MIN_AREA = 20;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -515,6 +528,168 @@
     return out;
   }
 
+  /**
+   * 构建差异掩码（可独立调用，纯像素计算）。
+   *
+   * 逐像素比较参考图 refData 与校准扫描图 cmpData（二者必须同为 w × h 的
+   * RGBA 缓冲，cmpData 通常由 transformRGBA 重采样得到）：
+   *   - 仅当双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）时该像素参与统计；
+   *   - 参与像素任一 RGB 通道差值的绝对值严格大于 colorThreshold（0~255）
+   *     时标为差异（掩码字节为 1，否则为 0）；
+   *   - 其余像素掩码为 0。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} refData 参考图 RGBA 数据
+   * @param {Uint8Array|Uint8ClampedArray} cmpData 校准扫描图 RGBA 数据（同尺寸）
+   * @param {number} w 宽（正整数）
+   * @param {number} h 高（正整数）
+   * @param {number} [colorThreshold=DEFAULT_DIFF_THRESHOLD] 色差阈值（0~255 有限数）
+   * @returns {{mask:Uint8Array, compared:number, diffCount:number,
+   *            width:number, height:number, colorThreshold:number}}
+   *          mask 每像素 1 字节；compared 为双方 alpha 均达标的参与统计像素数
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function buildDifferenceMask(refData, cmpData, w, h, colorThreshold) {
+    if (!refData || !cmpData || !Number.isInteger(w) || !Number.isInteger(h) ||
+        w <= 0 || h <= 0 ||
+        refData.length !== w * h * 4 || cmpData.length !== w * h * 4) {
+      throw new FitError('BAD_INPUT', '差异比较的两张 RGBA 图像数据缺失或尺寸不一致');
+    }
+    const t = colorThreshold === undefined ? DEFAULT_DIFF_THRESHOLD : colorThreshold;
+    if (!Number.isFinite(t) || t < 0 || t > 255) {
+      throw new FitError('BAD_INPUT', '色差阈值必须为 0~255 的有限数字');
+    }
+    const n = w * h;
+    const mask = new Uint8Array(n);
+    let compared = 0, diffCount = 0;
+    for (let p = 0; p < n; p++) {
+      const o = p * 4;
+      // 仅统计双方 alpha 均不低于 128 的像素
+      if (refData[o + 3] < DIFF_ALPHA_MIN || cmpData[o + 3] < DIFF_ALPHA_MIN) continue;
+      compared++;
+      // 任一 RGB 通道差值超过阈值（严格大于）即标为差异
+      if (Math.abs(refData[o] - cmpData[o]) > t ||
+          Math.abs(refData[o + 1] - cmpData[o + 1]) > t ||
+          Math.abs(refData[o + 2] - cmpData[o + 2]) > t) {
+        mask[p] = 1;
+        diffCount++;
+      }
+    }
+    return { mask, compared, diffCount, width: w, height: h, colorThreshold: t };
+  }
+
+  /**
+   * 对差异掩码做八邻域连通分组（可独立调用，纯像素计算）。
+   *
+   * 以八邻域（含对角）连通的掩码像素归为同一区域（迭代式泛洪，避免大图爆栈）；
+   * 像素数 < minArea 的区域被过滤（minArea 为非负整数，0 表示不过滤）。
+   * 剩余区域按面积降序输出（面积相同按扫描到的先后排序，结果可复现）。
+   * 注意：处理过程中会就地把已访问的掩码字节置 0，调用后 mask 被清空。
+   *
+   * @param {Uint8Array} mask buildDifferenceMask 输出的每像素 1 字节掩码（会被清空）
+   * @param {number} w 宽
+   * @param {number} h 高
+   * @param {number} [minArea=DEFAULT_DIFF_MIN_AREA] 最小面积（像素数小于该值的区域过滤）
+   * @returns {{regions:Array<{index:number, pixelCount:number,
+   *            minX:number, minY:number, maxX:number, maxY:number,
+   *            bounds:{x:number,y:number,width:number,height:number}}>,
+   *            totalDiffPixels:number, keptPixelCount:number,
+   *            filteredCount:number, minArea:number}}
+   *          坐标均为参考图像素坐标（闭区间），bounds.x/y 为左上角、width/height 为边长
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function groupDiffRegions(mask, w, h, minArea) {
+    if (!mask || !Number.isInteger(w) || !Number.isInteger(h) ||
+        w <= 0 || h <= 0 || mask.length !== w * h) {
+      throw new FitError('BAD_INPUT', '差异掩码缺失或长度与宽高不符');
+    }
+    const area = minArea === undefined ? DEFAULT_DIFF_MIN_AREA : minArea;
+    if (!Number.isFinite(area) || area < 0 || !Number.isInteger(area)) {
+      throw new FitError('BAD_INPUT', '最小面积必须为不小于 0 的整数');
+    }
+
+    const found = [];
+    let totalDiffPixels = 0;
+    const stack = [];
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const seed = y * w + x;
+        if (!mask[seed]) continue;
+        // 八邻域迭代泛洪：就地清零已访问像素
+        mask[seed] = 0;
+        stack.length = 0;
+        stack.push(seed);
+        let pixelCount = 0;
+        let minX = x, minY = y, maxX = x, maxY = y;
+        while (stack.length) {
+          const p = stack.pop();
+          const px = p % w, py = (p - px) / w;
+          pixelCount++;
+          totalDiffPixels++;
+          if (px < minX) minX = px; else if (px > maxX) maxX = px;
+          if (py < minY) minY = py; else if (py > maxY) maxY = py;
+          for (let dy = -1; dy <= 1; dy++) {
+            const ny = py + dy;
+            if (ny < 0 || ny >= h) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nx = px + dx;
+              if (nx < 0 || nx >= w) continue;
+              const q = ny * w + nx;
+              if (mask[q]) { mask[q] = 0; stack.push(q); }
+            }
+          }
+        }
+        if (pixelCount >= area) found.push({ pixelCount, minX, minY, maxX, maxY });
+      }
+    }
+    // 按面积降序（同面积保留扫描顺序，结果可复现）
+    found.sort((r1, r2) => r2.pixelCount - r1.pixelCount);
+
+    let keptPixelCount = 0;
+    const regions = found.map((r, i) => {
+      keptPixelCount += r.pixelCount;
+      return {
+        index: i + 1, // 1 起编号，按面积排序
+        pixelCount: r.pixelCount,
+        minX: r.minX, minY: r.minY, maxX: r.maxX, maxY: r.maxY,
+        // 边框：左上角 + 边长（坐标闭区间，width = maxX − minX + 1）
+        bounds: {
+          x: r.minX, y: r.minY,
+          width: r.maxX - r.minX + 1, height: r.maxY - r.minY + 1
+        }
+      };
+    });
+    return {
+      regions,
+      totalDiffPixels,
+      keptPixelCount,
+      filteredCount: totalDiffPixels - keptPixelCount,
+      minArea: area
+    };
+  }
+
+  /**
+   * 一步完成「差异掩码 + 八邻域分组 + 最小面积过滤」的便捷函数。
+   * 语义与参数同 buildDifferenceMask / groupDiffRegions。
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function findDifferenceRegions(refData, cmpData, w, h, colorThreshold, minArea) {
+    const m = buildDifferenceMask(refData, cmpData, w, h, colorThreshold);
+    const g = groupDiffRegions(m.mask, w, h, minArea);
+    return {
+      regions: g.regions,
+      compared: m.compared,
+      diffCount: m.diffCount,
+      totalDiffPixels: g.totalDiffPixels,
+      keptPixelCount: g.keptPixelCount,
+      filteredCount: g.filteredCount,
+      width: w,
+      height: h,
+      colorThreshold: m.colorThreshold,
+      minArea: g.minArea
+    };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
@@ -524,12 +699,18 @@
     checkExportMatrix,
     invertMatrix,
     transformRGBA,
+    buildDifferenceMask,
+    groupDiffRegions,
+    findDifferenceRegions,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
     MAX_CANDIDATES,
     MAX_REFINE_ITERS,
     DEFAULT_TOLERANCE_PX,
-    MIN_MATRIX_DET
+    MIN_MATRIX_DET,
+    DIFF_ALPHA_MIN,
+    DEFAULT_DIFF_THRESHOLD,
+    DEFAULT_DIFF_MIN_AREA
   };
 });

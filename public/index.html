@@ -75,6 +75,39 @@
     <canvas id="overlayCanvas"></canvas>
   </section>
 
+  <section class="diff-wrap">
+    <h2>差异区域</h2>
+    <div class="diff-controls">
+      <label class="opt-label tol-label" title="双方 alpha 均不低于 128 的参与像素中，任一 RGB 通道差值的绝对值超过该值即标为差异（0~255，严格大于）">
+        色差阈值
+        <input type="number" id="diffThreshold" min="0" max="255" step="1" value="32">
+      </label>
+      <label class="opt-label tol-label" title="八邻域连通分组后，像素数小于该值的差异区域将被过滤（0 表示不过滤）">
+        最小面积
+        <input type="number" id="diffMinArea" min="0" step="1" value="20">
+        px
+      </label>
+      <span id="diffStats" class="diff-stats"></span>
+      <span id="diffHint" class="export-hint"></span>
+    </div>
+    <div class="diff-body">
+      <figure class="diff-view">
+        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝保留区域（按面积排序，坐标为参考图像素）</span></figcaption>
+        <canvas id="diffCanvas"></canvas>
+      </figure>
+      <div class="diff-side">
+        <table id="diffTable">
+          <thead>
+            <tr>
+              <th>#</th><th>像素数</th><th>边框 (x, y, w, h)</th><th>参考图坐标范围</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <footer>
     <p>仿射最小二乘拟合在浏览器本地完成；图像不会上传服务器。POST /api/fit 提供同样的拟合接口供程序化调用。</p>
   </footer>

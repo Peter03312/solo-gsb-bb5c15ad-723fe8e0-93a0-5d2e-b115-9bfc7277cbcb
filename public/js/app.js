@@ -19,6 +19,13 @@
  *    点集近共线显示「无法验证」，稳健模式外点显示「不参与」；状态栏与拟合面板
  *    汇总可验证点的 RMSE / 最大误差（零个可验证点时显示不可用），最差点橙色标出。
  *    点位增删/拖动、模式与容差变化均实时重算。
+ *  - 「差异区域」视图：两图已加载且当前拟合矩阵通过导出校验（checkExportMatrix）
+ *    时，复用校准扫描图的 RGBA 重采样结果（Affine.transformRGBA）与参考图逐像素
+ *    比较；仅统计双方 alpha 均 ≥ 128 的像素，任一 RGB 通道差值超过可调色差阈值
+ *    即标为差异，差异掩码做八邻域连通分组并过滤小于可调最小面积的区域，按面积
+ *    排序展示边框、像素数与参考图坐标范围。阈值 / 最小面积 / 点位 / 拟合模式或
+ *    容差变化后去抖重算；条件失效（缺图、拟合无效、矩阵不可导出、参数非法）时
+ *    清空旧标记并说明原因。全部像素处理在浏览器本地完成，图像不上传服务器。
  */
 (function () {
   'use strict';
@@ -35,7 +42,13 @@
     robust: false,           // 是否启用稳健模式
     tolerancePx: Affine.DEFAULT_TOLERANCE_PX, // 稳健模式参考图像素容差
     dragging: null,          // {id, which:'ref'|'scan'}
-    opacity: 0.5
+    opacity: 0.5,
+    // 差异区域视图
+    diffThreshold: Affine.DEFAULT_DIFF_THRESHOLD, // 色差阈值（任一 RGB 通道差值严格大于即差异）
+    diffMinArea: Affine.DEFAULT_DIFF_MIN_AREA,     // 最小面积（小于该像素数的连通区域被过滤）
+    diffTimer: null,         // 去抖句柄（拖动点位时合并重算）
+    diffCache: null,         // {key, width, height, refData, calibratedData}
+    diffResult: null         // 最近一次 findDifferenceRegions 结果（条件失效时为 null）
   };
 
   const HIT_RADIUS_CSS = 12;   // 命中半径（CSS 像素）
@@ -43,6 +56,11 @@
   const COLOR_OUTLIER = '#ef4444';  // 外点：红（虚线）
   const COLOR_MAX = '#f59e0b';      // 内点中最大残差：橙
   const COLOR_PENDING = '#eab308';
+  const DIFF_DEBOUNCE_MS = 80;      // 差异重算去抖（拖动时合并）
+  const COLOR_DIFF = '#ef4444';     // 差异像素：红
+  const COLOR_DIFF_BOX = '#f59e0b'; // 保留区域边框：橙
+  const DIFF_MASK_ALPHA = 0.55;     // 差异掩码叠加不透明度
+  const DIFF_MAX_TABLE_ROWS = 200;  // 区域表最多列出的行数
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
@@ -63,6 +81,12 @@
   const robustModeInput = $('robustMode');
   const toleranceInput = $('tolerance');
   const tolLabel = $('tolLabel');
+  const diffCanvas = $('diffCanvas');
+  const diffStatsEl = $('diffStats');
+  const diffHintEl = $('diffHint');
+  const diffTableBody = $('diffTable').querySelector('tbody');
+  const diffThresholdInput = $('diffThreshold');
+  const diffMinAreaInput = $('diffMinArea');
 
   // ---------- 图像加载 ----------
   function loadImageFromFile(file) {
@@ -127,6 +151,8 @@
       }
     }
     render();
+    // 拟合矩阵可能变化（点位拖动/增删、模式、容差），差异结果跟随重算
+    scheduleDiffUpdate();
   }
 
   // ---------- 控制点操作 ----------
@@ -631,6 +657,225 @@
     }
   }
 
+  // ---------- 差异区域视图 ----------
+  // 差异视图的前置条件与「导出校准扫描图」一致：两图已加载、拟合有效且矩阵
+  // 可导出（六参数有限且线性部分行列式 |det| > 1e-12）
+  function diffReadiness() {
+    return exportImageReadiness();
+  }
+
+  // 差异参数校验：色差阈值 0~255；最小面积为不小于 0 的整数
+  function diffParams() {
+    const t = parseFloat(diffThresholdInput.value);
+    if (!Number.isFinite(t) || t < 0 || t > 255) {
+      return { ok: false, reason: '色差阈值必须为 0~255 的数字（任一 RGB 通道差值严格大于该值才标为差异）' };
+    }
+    const a = parseFloat(diffMinAreaInput.value);
+    if (!Number.isFinite(a) || a < 0 || !Number.isInteger(a)) {
+      return { ok: false, reason: '最小面积必须为不小于 0 的整数（像素，0 表示不过滤）' };
+    }
+    return { ok: true, threshold: t, minArea: a };
+  }
+
+  // 拟合（矩阵）/ 图像可能变化时去抖重算，避免拖动点位时逐像素重采样卡顿
+  function scheduleDiffUpdate() {
+    if (state.diffTimer !== null) clearTimeout(state.diffTimer);
+    state.diffTimer = setTimeout(runDiffUpdate, DIFF_DEBOUNCE_MS);
+  }
+
+  // 将图像绘制到本地离屏 canvas 读取 RGBA（不上传服务器）
+  function readImageRGBA(img) {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, w, h).data;
+  }
+
+  // 缓存参考图像素与校准扫描图重采样结果：仅当两图或矩阵变化时才重新重采样；
+  // 只调色差阈值 / 最小面积时复用同一结果
+  function ensureDiffCache(w, h) {
+    const m = state.fit.matrix;
+    const key = [w, h, m.a, m.b, m.c, m.d, m.e, m.f].join('|');
+    // 换图后即使尺寸与矩阵相同也必须重新读取像素（以图像对象为身份）
+    if (state.diffCache && state.diffCache.key === key &&
+        state.diffCache.refImg === state.refImg && state.diffCache.scanImg === state.scanImg) {
+      return state.diffCache;
+    }
+    const refData = readImageRGBA(state.refImg);
+    const sw = state.scanImg.naturalWidth, sh = state.scanImg.naturalHeight;
+    const scanData = readImageRGBA(state.scanImg);
+    // 复用导出校准扫描图的同一套逆仿射重采样（双线性插值、预乘 alpha、越界透明黑）
+    const calibratedData = Affine.transformRGBA(scanData, sw, sh, m, w, h);
+    state.diffCache = {
+      key, width: w, height: h, refImg: state.refImg, scanImg: state.scanImg,
+      refData, calibratedData
+    };
+    return state.diffCache;
+  }
+
+  // 条件失效 / 参数非法时清空旧标记并说明原因
+  function clearDiff(reason) {
+    if (state.diffTimer !== null) {
+      clearTimeout(state.diffTimer);
+      state.diffTimer = null;
+    }
+    state.diffResult = null;
+    state.diffCache = null;
+    diffStatsEl.textContent = '';
+    diffTableBody.innerHTML = '';
+    diffHintEl.textContent = reason ? '差异区域暂不可用：' + reason : '';
+    drawDiffView();
+  }
+
+  function runDiffUpdate() {
+    state.diffTimer = null;
+    const ready = diffReadiness();
+    if (!ready.ok) { // 缺图 / 拟合无效 / 矩阵不可导出：清空旧标记并说明原因
+      clearDiff(ready.reason);
+      return;
+    }
+    const params = diffParams();
+    if (!params.ok) { // 参数非法：同样清空，避免展示与输入不符的旧结果
+      clearDiff(params.reason);
+      return;
+    }
+    try {
+      const w = state.refImg.naturalWidth;
+      const h = state.refImg.naturalHeight;
+      const cache = ensureDiffCache(w, h);
+      const built = Affine.buildDifferenceMask(
+        cache.refData, cache.calibratedData, w, h, params.threshold
+      );
+      // 分组会就地清空掩码，先据此生成红色差异覆盖层（离屏 canvas）
+      const overlay = makeMaskOverlay(built.mask, w, h);
+      const grouped = Affine.groupDiffRegions(built.mask, w, h, params.minArea);
+      state.diffResult = {
+        width: w,
+        height: h,
+        compared: built.compared,
+        diffCount: built.diffCount,
+        regions: grouped.regions,
+        totalDiffPixels: grouped.totalDiffPixels,
+        keptPixelCount: grouped.keptPixelCount,
+        filteredCount: grouped.filteredCount,
+        threshold: built.colorThreshold,
+        minArea: grouped.minArea,
+        overlay
+      };
+      diffHintEl.textContent = '';
+      drawDiffView();
+      renderDiffStats();
+      renderDiffTable();
+    } catch (err) {
+      clearDiff(err.message || String(err));
+    }
+  }
+
+  // 差异掩码 → 红色不透明覆盖层（绘制到差异视图时再调透明度）
+  function makeMaskOverlay(mask, w, h) {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const px = new Uint8ClampedArray(w * h * 4);
+    for (let p = 0; p < mask.length; p++) {
+      if (mask[p]) {
+        const o = p * 4;
+        px[o] = 239; px[o + 1] = 68; px[o + 2] = 68; px[o + 3] = 255;
+      }
+    }
+    c.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0);
+    return c;
+  }
+
+  function drawDiffPlaceholder(text) {
+    drawPlaceholder(diffCanvas, text);
+  }
+
+  function drawDiffView() {
+    const r = state.diffResult;
+    if (!r) {
+      drawDiffPlaceholder('满足条件后此处显示差异区域');
+      return;
+    }
+    if (diffCanvas.width !== r.width || diffCanvas.height !== r.height) {
+      diffCanvas.width = r.width;
+      diffCanvas.height = r.height;
+    }
+    const ctx = diffCanvas.getContext('2d');
+    ctx.globalAlpha = 1;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // 底图：参考图；再半透明叠加红色差异掩码
+    ctx.drawImage(state.refImg, 0, 0);
+    ctx.globalAlpha = DIFF_MASK_ALPHA;
+    ctx.drawImage(r.overlay, 0, 0);
+    ctx.globalAlpha = 1;
+
+    // 保留区域边框（橙），面积最大的若干区域标注序号（与表格一致）
+    const scale = canvasScale(diffCanvas);
+    ctx.lineWidth = 2 * scale;
+    ctx.strokeStyle = COLOR_DIFF_BOX;
+    const labelEvery = r.regions.length > 60 ? Math.ceil(r.regions.length / 24) : 1;
+    r.regions.forEach((reg) => {
+      const b = reg.bounds;
+      ctx.strokeRect(b.x, b.y, b.width, b.height);
+      if (reg.index <= 24 && (reg.index - 1) % labelEvery === 0) {
+        ctx.font = `bold ${12 * scale}px system-ui, sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        ctx.lineWidth = 3 * scale;
+        ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+        ctx.strokeText(String(reg.index), b.x + 3 * scale, b.y - 2 * scale);
+        ctx.fillStyle = COLOR_DIFF_BOX;
+        ctx.fillText(String(reg.index), b.x + 3 * scale, b.y - 2 * scale);
+        ctx.strokeStyle = COLOR_DIFF_BOX;
+        ctx.lineWidth = 2 * scale;
+      }
+    });
+  }
+
+  function renderDiffStats() {
+    const r = state.diffResult;
+    if (!r) { diffStatsEl.textContent = ''; return; }
+    const pct = r.compared > 0 ? (r.diffCount / r.compared * 100) : 0;
+    if (r.diffCount === 0) {
+      diffStatsEl.textContent =
+        `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
+        `色差阈值 ${r.threshold}：未发现差异像素。`;
+      return;
+    }
+    diffStatsEl.textContent =
+      `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
+      `差异像素 ${r.diffCount}（${fmt(pct, 2)}%）· ` +
+      `保留区域 ${r.regions.length} 个、共 ${r.keptPixelCount} 像素` +
+      `（最小面积 ${r.minArea}，过滤散点 ${r.filteredCount} 像素）· 色差阈值 ${r.threshold}`;
+  }
+
+  function renderDiffTable() {
+    const r = state.diffResult;
+    if (!r) { diffTableBody.innerHTML = ''; return; }
+    if (r.regions.length === 0) {
+      diffTableBody.innerHTML =
+        `<tr><td colspan="4" class="diff-empty">未发现面积 ≥ ${r.minArea} 像素的差异区域` +
+        `（差异像素共 ${r.diffCount}，均被最小面积过滤）。</td></tr>`;
+      return;
+    }
+    const shown = r.regions.slice(0, DIFF_MAX_TABLE_ROWS);
+    diffTableBody.innerHTML = shown.map((g) => {
+      const b = g.bounds;
+      return `<tr>
+        <td>${g.index}</td>
+        <td>${g.pixelCount}</td>
+        <td>(${b.x}, ${b.y}, ${b.width}×${b.height})</td>
+        <td>x ${g.minX}–${g.maxX} · y ${g.minY}–${g.maxY}</td>
+      </tr>`;
+    }).join('') + (r.regions.length > DIFF_MAX_TABLE_ROWS
+      ? `<tr><td colspan="4" class="diff-empty">其余 ${r.regions.length - DIFF_MAX_TABLE_ROWS} 个区域已省略（按面积排序）</td></tr>`
+      : '');
+  }
+
   // ---------- 示例图像 ----------
   function drawSampleContent(g, w, h) {
     g.fillStyle = '#f8fafc';
@@ -719,10 +964,22 @@
         state.fit = null;
         state.fitError = '像素容差必须为不小于 0 的数字（参考图像素）。';
         render();
+        // 拟合矩阵失效：差异条件同步失效，清空旧标记并说明原因
+        scheduleDiffUpdate();
         return;
       }
       state.tolerancePx = v;
       recompute();
+    });
+
+    // 差异区域参数：阈值 / 最小面积变化后去抖重算（重采样结果缓存，仅重算掩码）
+    diffThresholdInput.addEventListener('input', () => {
+      state.diffThreshold = parseFloat(diffThresholdInput.value);
+      scheduleDiffUpdate();
+    });
+    diffMinAreaInput.addEventListener('input', () => {
+      state.diffMinArea = parseFloat(diffMinAreaInput.value);
+      scheduleDiffUpdate();
     });
 
     ptTableBody.addEventListener('click', (e) => {
@@ -740,6 +997,8 @@
     bindCanvas(refCanvas, 'ref');
     bindCanvas(scanCanvas, 'scan');
     render();
+    // 差异视图初始为不可用状态（缺图），说明原因；之后由去抖更新驱动
+    clearDiff(diffReadiness().reason);
   }
 
   init();
